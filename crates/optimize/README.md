@@ -29,7 +29,10 @@ let report = optimize_with_progress(&mut doc, &settings, &mut |stage| keep_going
   Page-local `/UserUnit` scaling is included, so large-format pages are measured in physical inches.
   If a use can't be
   measured (forms nested deeper or drawn too many times, or content that doesn't decode or is
-  damaged partway, which may draw an image larger past the damage), no image is resampled. Colour and grayscale images above a
+  damaged partway, which may draw an image larger past the damage), no image is resampled.
+  `measured_resolutions` gives the same measurement for a report instead: what was measured where
+  the walk could read, and whether it read everything (print readiness flags a page it didn't
+  finish, as an image drawn only there isn't measured at all). Colour and grayscale images above a
   threshold are resampled with a bicubic (Catmull-Rom) filter to a target resolution and
   stored as JPEG (Acrobat's quality steps) or ZIP; soft masks are resampled with their image. A
   stencil `/Mask` has its own resolution, so the picture changes under it and it keeps its size and

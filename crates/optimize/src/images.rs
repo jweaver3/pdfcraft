@@ -265,6 +265,32 @@ pub fn effective_resolutions(doc: &Document, pages: &[ObjRef]) -> HashMap<ObjRef
     ppi
 }
 
+/// What [`measured_resolutions`] found.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Resolutions {
+    /// The smallest resolution (ppi) measured for each image the walk reached, over the uses it
+    /// read. A use the walk missed may be smaller.
+    pub ppi: HashMap<ObjRef, f64>,
+    /// False when a use may have been missed: a form or page content didn't decode within its
+    /// budget or is damaged partway, forms nest deeper than the walk follows, or forms are drawn
+    /// too many times. An image drawn only there is not in [`Self::ppi`] at all.
+    pub complete: bool,
+}
+
+/// The resolution of every image `pages` draw, as far as the walk could read them, and whether it
+/// read everything.
+///
+/// Unlike [`effective_resolutions`], an incomplete walk keeps the resolutions it measured: a
+/// report can show those and say separately that something was not measured, where resampling
+/// must not trust them.
+pub fn measured_resolutions(doc: &Document, pages: &[ObjRef]) -> Resolutions {
+    match walk_raw(doc, pages, &mut |_| true) {
+        Ok(walk) => Resolutions { ppi: walk.out, complete: walk.complete },
+        // Only a cancelled walk fails, and this one is never cancelled; report it as unread.
+        Err(_) => Resolutions { ppi: HashMap::new(), complete: false },
+    }
+}
+
 /// What a walk of the pages found: each image's resolution, the images under remapped device
 /// spaces, and the references followed.
 type PagesWalked = (HashMap<ObjRef, f64>, HashSet<u32>, Read);
@@ -275,6 +301,17 @@ type PagesWalked = (HashMap<ObjRef, f64>, HashSet<u32>, Read);
 ///
 /// `tick` hears how many pages are done, and stops the walk by returning false.
 fn walk_pages(doc: &Document, pages: &[ObjRef], tick: &mut dyn FnMut(usize) -> bool) -> Result<PagesWalked, OptimizeError> {
+    let mut walk = walk_raw(doc, pages, tick)?;
+    if !walk.complete {
+        walk.out.values_mut().for_each(|v| *v = f64::INFINITY);
+        walk.defaults.extend(walk.out.keys().map(|r| r.num));
+    }
+    Ok((walk.out, walk.defaults, walk.read))
+}
+
+/// Walk `pages`, recording what each image is measured at where it was read, with
+/// [`Walk::complete`] false when a use may have been missed.
+fn walk_raw<'a>(doc: &'a Document, pages: &[ObjRef], tick: &mut dyn FnMut(usize) -> bool) -> Result<Walk<'a>, OptimizeError> {
     let mut walk = Walk {
         doc,
         path: Vec::new(),
@@ -305,11 +342,7 @@ fn walk_pages(doc: &Document, pages: &[ObjRef], tick: &mut dyn FnMut(usize) -> b
         let unit = page.user_unit(doc);
         walk.content(&data, &res, holder, Matrix([unit, 0.0, 0.0, unit, 0.0, 0.0]), false);
     }
-    if !walk.complete {
-        walk.out.values_mut().for_each(|v| *v = f64::INFINITY);
-        walk.defaults.extend(walk.out.keys().map(|r| r.num));
-    }
-    Ok((walk.out, walk.defaults, walk.read))
+    Ok(walk)
 }
 
 /// Whether image `r` is one [`one_bit`] may make grey: eight-bit `DeviceRGB`, not in an image codec.

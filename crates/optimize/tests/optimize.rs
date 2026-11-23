@@ -4120,6 +4120,40 @@ fn content_damaged_partway_leaves_every_image_at_its_resolution() {
     }
 }
 
+/// `measured_resolutions` keeps what the walk measured before a form it couldn't read, and says the
+/// walk didn't finish, where `effective_resolutions` gives up on every image. An image drawn only
+/// inside the unreadable form is in neither map, so the flag is the only sign of it (#8106).
+#[test]
+fn measured_resolutions_keep_what_was_read_and_report_an_unfinished_walk() {
+    let mut doc = Document::new_empty();
+    let seen = image(&mut doc, 720, 720, 1, false, None);
+    let hidden = image(&mut doc, 300, 300, 1, false, None);
+    let mut bad = Stream::from_raw(Dict::new(), vec![0xff; 16]);
+    bad.dict.set(b"Filter".to_vec(), Object::name("FlateDecode"));
+    bad.dict.set(b"Subtype".to_vec(), Object::name("Form"));
+    bad.dict.set(b"BBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 1.into(), 1.into()]));
+    bad.dict.set(b"Resources".to_vec(), Object::Dict(resources(xobjects(&[("Im", hidden)]))));
+    let f = doc.add(Object::Stream(bad));
+    let whole = page(&mut doc, &[("Im", seen)], "q 72 0 0 72 0 0 cm /Im Do Q");
+    let measured = pdfcraft_optimize::measured_resolutions(&doc, &[whole]);
+    assert!(measured.complete);
+    assert_eq!(measured.ppi.get(&seen), Some(&720.0));
+
+    let p = page(&mut doc, &[("Im", seen), ("F", f)], "q 72 0 0 72 0 0 cm /Im Do Q /F Do");
+    let measured = pdfcraft_optimize::measured_resolutions(&doc, &[p]);
+    assert!(!measured.complete);
+    assert_eq!(measured.ppi.get(&seen), Some(&720.0));
+    assert_eq!(measured.ppi.get(&hidden), None);
+    // Resampling still trusts none of it.
+    assert_eq!(effective_resolutions(&doc, &[p]).get(&seen), Some(&f64::INFINITY));
+
+    // A page whose only image is in the unreadable form has nothing measured at all.
+    let only = page(&mut doc, &[("F", f)], "/F Do");
+    let measured = pdfcraft_optimize::measured_resolutions(&doc, &[only]);
+    assert!(!measured.complete);
+    assert!(measured.ppi.is_empty(), "{:?}", measured.ppi);
+}
+
 /// One page damaged partway stops resampling for the whole document: another page drawing the same
 /// image at its full resolution, whole, doesn't get it resampled either.
 #[test]

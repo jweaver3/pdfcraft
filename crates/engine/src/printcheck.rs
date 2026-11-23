@@ -60,7 +60,8 @@ pub struct PrintReadiness {
     pub pdfa_issues: Vec<Issue>,
     pub findings: Vec<Finding>,
     /// Image placements whose resolution couldn't be measured (a degenerate or non-finite
-    /// placement matrix). They are neither passed nor failed.
+    /// placement matrix), plus one for each page whose content couldn't be read in full, where an
+    /// image may have been missed. They are neither passed nor failed.
     pub resolution_unknown: usize,
 }
 
@@ -164,7 +165,8 @@ fn inspect(doc: &Document) -> PrintReadiness {
         .collect();
     let model_pages = pdfcraft_model::pages(doc);
     let pages = page_reports(doc, &model_pages);
-    let (images, resolution_unknown) = image_reports(doc, &model_pages);
+    let ImageReports { images, unknown, unread_pages } = image_reports(doc, &model_pages);
+    let resolution_unknown = unknown.saturating_add(unread_pages.len());
     let mut findings = Vec::new();
     // Without a TrimBox the trim, the bleed and the crop are the same box, so there is no bleed to
     // measure. That is a property of the document, not a fault on every page: report it once.
@@ -232,15 +234,25 @@ fn inspect(doc: &Document) -> PrintReadiness {
             page: None,
         });
     }
-    if resolution_unknown > 0 {
+    if unknown > 0 {
         findings.push(Finding {
             id: "image-ppi-unknown",
             severity: "info",
             message: format!(
-                "The resolution of {resolution_unknown} image placement{} couldn't be measured (its placement matrix is degenerate or not finite).",
-                if resolution_unknown == 1 { "" } else { "s" }
+                "The resolution of {unknown} image placement{} couldn't be measured (its placement matrix is degenerate or not finite).",
+                if unknown == 1 { "" } else { "s" }
             ),
             page: None,
+        });
+    }
+    for page in unread_pages {
+        findings.push(Finding {
+            id: "image-ppi-unknown",
+            severity: "info",
+            message: format!(
+                "Page {page} draws content that couldn't be read in full (damaged, too large to decode, or forms nested or repeated too deeply), so an image on it may not have been measured."
+            ),
+            page: Some(page),
         });
     }
     findings.sort_by(|a, b| a.page.cmp(&b.page).then(a.id.cmp(b.id)).then(a.message.cmp(&b.message)));
@@ -273,10 +285,23 @@ fn page_reports(doc: &Document, pages: &[pdfcraft_model::Page]) -> Vec<PageBoxes
         .collect()
 }
 
-/// The images drawn on each page, and how many placements had no measurable resolution.
-fn image_reports(doc: &Document, pages: &[pdfcraft_model::Page]) -> (Vec<DrawnImage>, usize) {
+/// What [`image_reports`] measured.
+struct ImageReports {
+    /// The images drawn on each page, at the resolution measured where they are drawn.
+    images: Vec<DrawnImage>,
+    /// Placements with no measurable resolution (a degenerate or non-finite matrix).
+    unknown: usize,
+    /// 1-based pages whose content couldn't be read in full, so an image drawn there may be
+    /// missing from `images`.
+    unread_pages: Vec<u32>,
+}
+
+/// The images drawn on each page, how many placements had no measurable resolution, and the pages
+/// whose content couldn't be read in full.
+fn image_reports(doc: &Document, pages: &[pdfcraft_model::Page]) -> ImageReports {
     let mut out = Vec::new();
     let mut unknown = 0usize;
+    let mut unread_pages = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (i, page) in pages.iter().enumerate() {
         let page_no = (i + 1) as u32;
@@ -297,8 +322,15 @@ fn image_reports(doc: &Document, pages: &[pdfcraft_model::Page]) -> (Vec<DrawnIm
             }
         }
         // Images drawn inside a form XObject are not listed above. Their resolution is the
-        // smallest use on this page, which is what the optimizer already measures.
-        for (object, ppi) in pdfcraft_optimize::effective_resolutions(doc, &[page.obj]) {
+        // smallest use on this page, which is what the optimizer already measures. An image the
+        // walk couldn't reach (in a form that doesn't decode, say) isn't in its map at all, so a
+        // walk that didn't finish marks the page as unread rather than letting it pass. Images
+        // measured where it did read keep their values.
+        let measured = pdfcraft_optimize::measured_resolutions(doc, &[page.obj]);
+        if !measured.complete {
+            unread_pages.push(page_no);
+        }
+        for (object, ppi) in measured.ppi {
             if seen.contains(&(page_no, object)) {
                 continue;
             }
@@ -310,7 +342,7 @@ fn image_reports(doc: &Document, pages: &[pdfcraft_model::Page]) -> (Vec<DrawnIm
         }
     }
     out.sort_by(|a, b| a.page.cmp(&b.page).then(a.name.cmp(&b.name)).then(a.ppi.total_cmp(&b.ppi)));
-    (out, unknown)
+    ImageReports { images: out, unknown, unread_pages }
 }
 
 /// The effective resolution of a raster placement, `None` for Form artwork. Not finite (NaN)
@@ -470,6 +502,77 @@ mod tests {
         let report = inspect(&doc);
         assert!(report.findings.iter().any(|f| f.id == "page-bleed" && f.severity == "warn" && f.page == Some(4)));
         assert_eq!(report.findings.iter().filter(|f| f.id == "page-bleed").count(), 1);
+    }
+
+    /// A form XObject drawing `name` → `object`, whose content stream is FlateDecode that doesn't
+    /// decode.
+    fn unreadable_form(doc: &mut Document, name: &str, object: pdfcraft_cos::ObjRef) -> pdfcraft_cos::ObjRef {
+        let mut x = Dict::new();
+        x.set(name.as_bytes().to_vec(), Object::Ref(object));
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(x));
+        let mut d = Dict::new();
+        d.set(b"Type".to_vec(), Object::name("XObject"));
+        d.set(b"Subtype".to_vec(), Object::name("Form"));
+        d.set(b"BBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 612.into(), 792.into()]));
+        d.set(b"Resources".to_vec(), Object::Dict(res));
+        d.set(b"Filter".to_vec(), Object::name("FlateDecode"));
+        doc.add(Object::Stream(Stream::from_raw(d, vec![0xff; 16])))
+    }
+
+    /// #8106: a page whose only image is drawn by a form that doesn't decode was passed, because
+    /// the walk never reached the image and so had nothing to report as unknown.
+    #[test]
+    fn a_page_whose_image_is_in_unreadable_content_is_not_passed() {
+        let mut doc = Document::new_empty();
+        let img = image(&mut doc, 100, 100);
+        let fm = unreadable_form(&mut doc, "Im", img);
+        page(&mut doc, "Fm", fm, "q 144 0 0 144 36 600 cm /Fm Do Q");
+        let report = inspect(&doc);
+        let unknown: Vec<_> = report.findings.iter().filter(|f| f.id == "image-ppi-unknown").collect();
+        assert_eq!(unknown.len(), 1, "{:?}", report.findings);
+        assert_eq!(unknown[0].page, Some(1));
+        assert_eq!(report.resolution_unknown, 1);
+    }
+
+    /// An image measured where the walk could read keeps its resolution (and fails as it should)
+    /// beside the note about the form it couldn't read; a page with nothing unread gets no note.
+    #[test]
+    fn images_measured_beside_unreadable_content_keep_their_resolution() {
+        let mut doc = Document::new_empty();
+        let soft = image(&mut doc, 100, 100);
+        let hidden = image(&mut doc, 600, 600);
+        let fm = unreadable_form(&mut doc, "Im", hidden);
+        // A readable form drawing `soft` at 50 ppi, beside the unreadable one.
+        let mut x = Dict::new();
+        x.set(b"Im".to_vec(), Object::Ref(soft));
+        let mut res = Dict::new();
+        res.set(b"XObject".to_vec(), Object::Dict(x));
+        let mut d = Dict::new();
+        d.set(b"Subtype".to_vec(), Object::name("Form"));
+        d.set(b"BBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 1.into(), 1.into()]));
+        d.set(b"Resources".to_vec(), Object::Dict(res));
+        let readable = doc.add(Object::Stream(Stream::from_raw(d, b"/Im Do".to_vec())));
+        let p = page(&mut doc, "Ok", readable, "q 144 0 0 144 36 600 cm /Ok Do Q /Fm Do");
+        doc.update_dict(p, |d| {
+            let mut x = Dict::new();
+            x.set(b"Ok".to_vec(), Object::Ref(readable));
+            x.set(b"Fm".to_vec(), Object::Ref(fm));
+            let mut res = Dict::new();
+            res.set(b"XObject".to_vec(), Object::Dict(x));
+            d.set(b"Resources".to_vec(), Object::Dict(res));
+        })
+        .unwrap();
+        let sharp = image(&mut doc, 600, 600);
+        page(&mut doc, "Sharp", sharp, "q 72 0 0 72 36 36 cm /Sharp Do Q");
+
+        let report = inspect(&doc);
+        let measured = report.images.iter().find(|image| image.page == 1 && image.name == format!("object {soft}")).unwrap();
+        assert!((measured.ppi - 50.0).abs() < 0.5, "{}", measured.ppi);
+        assert!(report.findings.iter().any(|f| f.id == "image-ppi" && f.severity == "fail" && f.page == Some(1)), "{:?}", report.findings);
+        let unknown: Vec<_> = report.findings.iter().filter(|f| f.id == "image-ppi-unknown").map(|f| f.page).collect();
+        assert_eq!(unknown, vec![Some(1)], "{:?}", report.findings);
+        assert_eq!(report.resolution_unknown, 1);
     }
 
     #[test]
